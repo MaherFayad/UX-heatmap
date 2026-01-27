@@ -1,0 +1,10 @@
+ollama
+opencv-python
+numpy
+scipy
+jinja2
+matplotlib
+requests
+playwright
+google-genai
+python-dotenv
