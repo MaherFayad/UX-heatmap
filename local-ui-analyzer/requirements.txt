@@ -8,3 +8,10 @@ requests
 playwright
 google-genai
 python-dotenv
+
+torch
+torchvision
+albumentations
+tqdm
+Pillow
+

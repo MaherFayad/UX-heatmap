@@ -22,6 +22,7 @@ from google import genai
 from PIL import Image
 
 from dotenv import load_dotenv
+from saliency_bridge import SaliencyEngine
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +35,9 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Initialize Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Initialize Saliency Engine
+saliency_engine = SaliencyEngine()
 
 
 def load_image(path_or_url: str) -> np.ndarray:
@@ -362,7 +366,22 @@ Return ONLY raw JSON. No markdown formatting."""
     }]
 
 
-def generate_attention_heatmap(image: np.ndarray, boxes: list[dict]) -> np.ndarray:
+def get_saliency_map(image: np.ndarray, boxes: list[dict]) -> np.ndarray:
+    """
+    Get saliency map from EML-NET or fallback to Gaussian blobs.
+    Returns 0-1 float32 map.
+    """
+    # Try EML-NET
+    real_map = saliency_engine.predict(image)
+    if real_map is not None:
+        return real_map.astype(np.float32) / 255.0
+    
+    # Fallback
+    return generate_eml_heatmap_mask(image.shape[:2], boxes)
+
+
+def generate_attention_heatmap(image: np.ndarray, boxes: list[dict], 
+                              saliency_map: np.ndarray = None) -> np.ndarray:
     """
     Generate a Gaussian-blurred heatmap overlay based on attention boxes.
     Returns the image with heatmap overlay.
@@ -370,7 +389,10 @@ def generate_attention_heatmap(image: np.ndarray, boxes: list[dict]) -> np.ndarr
     height, width = image.shape[:2]
     
     # EML-NET Principle: Multi-Layer Fusion (Object + Context)
-    combined_heatmap = generate_eml_heatmap_mask((height, width), boxes)
+    if saliency_map is None:
+        combined_heatmap = generate_eml_heatmap_mask((height, width), boxes)
+    else:
+        combined_heatmap = saliency_map
     
     # Apply colormap (jet: blue=cold, red=hot)
     heatmap_colored = cm.jet(combined_heatmap)[:, :, :3]
@@ -932,8 +954,10 @@ def run_analysis(image_path: str, output_dir: str = "output",
     print(f"Found {len(boxes)} attention areas")
     
     # Step 2: Generate attention heatmap and AOI image
-    print("Generating attention heatmap and AOI image...")
-    attention_heatmap = generate_attention_heatmap(image, boxes)
+    print("Generating attention heatmap (Hybrid Saliency)...")
+    # Get the shared saliency map first
+    attention_mask = get_saliency_map(image, boxes)
+    attention_heatmap = generate_attention_heatmap(image, boxes, saliency_map=attention_mask)
     aoi_image = generate_aoi_image(image, boxes)
     
     # Step 3: Generate contrast map
@@ -946,9 +970,7 @@ def run_analysis(image_path: str, output_dir: str = "output",
     
     # Step 5: Calculate focus score
     print("Calculating focus score...")
-    print("Calculating focus score...")
-    # Use EML-NET generated mask for consistency
-    attention_mask = generate_eml_heatmap_mask((height, width), boxes)
+    # Use EML-NET generated mask (attention_mask computed above)
     focus_score = calculate_focus_score(attention_mask, boxes, image.shape)
     print(f"Focus Score: {focus_score:.1f}%")
     
