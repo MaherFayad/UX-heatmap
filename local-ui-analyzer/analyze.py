@@ -434,6 +434,9 @@ def generate_attention_heatmap(image: np.ndarray, boxes: list[dict],
     """
     Generate a Gaussian-blurred heatmap overlay based on attention boxes.
     Returns the image with heatmap overlay.
+    
+    Uses heavy blur to create soft, blobby attention pools similar to 
+    Attention Insight's visualization style.
     """
     height, width = image.shape[:2]
     
@@ -441,7 +444,20 @@ def generate_attention_heatmap(image: np.ndarray, boxes: list[dict],
     if saliency_map is None:
         combined_heatmap = generate_eml_heatmap_mask((height, width), boxes)
     else:
-        combined_heatmap = saliency_map
+        combined_heatmap = saliency_map.copy()
+    
+    # --- Soften the Heatmap (Attention Insight Style) ---
+    # Apply heavy Gaussian blur for soft, blobby attention pools
+    # Sigma scales with image size for consistent softness
+    blur_sigma = max(40, min(width, height) // 20)  # ~60-80px for 1920px width
+    combined_heatmap = gaussian_filter(combined_heatmap, sigma=blur_sigma)
+    
+    # Normalize after blur
+    if combined_heatmap.max() > 0:
+        combined_heatmap = combined_heatmap / combined_heatmap.max()
+    
+    # Apply non-linear curve for better hot/cold distinction (push mid-values down)
+    combined_heatmap = np.power(combined_heatmap, 1.5)
     
     # Apply colormap (jet: blue=cold, red=hot)
     heatmap_colored = cm.jet(combined_heatmap)[:, :, :3]
@@ -449,7 +465,7 @@ def generate_attention_heatmap(image: np.ndarray, boxes: list[dict],
     heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_RGB2BGR)
     
     # Blend with original image
-    alpha = 0.6
+    alpha = 0.55  # Slightly less opacity for cleaner look
     result = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
     
     return result
@@ -1034,25 +1050,34 @@ def generate_inhibition_kernel(shape: tuple, center: tuple, radius: int = 100) -
 def generate_deterministic_scanpath(saliency_map: np.ndarray, 
                                     num_fixations: int = 6,
                                     ior_radius: int = 100,
-                                    apply_reading_bias: bool = True) -> list[dict]:
+                                    apply_reading_bias: bool = True,
+                                    viewport_height: int = 900,
+                                    fixations_per_fold: int = 4) -> list[dict]:
     """
-    Generate a deterministic scanpath using Winner-Take-All (WTA) with 
-    Inhibition of Return (IOR).
+    Generate a deterministic scanpath using Progressive Viewport WTA with IOR.
     
-    This replaces VLM-based guessing with a pixel-perfect algorithm that:
-    1. Finds the maximum saliency peak
-    2. Records it as a fixation
-    3. Applies IOR to suppress that region
-    4. Repeats until num_fixations is reached
+    **Key Improvement**: Processes the page fold-by-fold (top-to-bottom) to simulate
+    real user scrolling behavior. Users can only fixate on content within their
+    current viewport, not content below the fold.
+    
+    Algorithm:
+    1. Divide the saliency map into viewport-sized folds
+    2. For each fold (top to bottom):
+       a. Apply F-pattern bias within the fold
+       b. Find top N saliency peaks using WTA + IOR
+       c. Move to next fold (simulating scroll)
+    3. IOR carries over between folds (recently seen areas stay inhibited)
     
     Args:
-        saliency_map: 2D numpy array (0-1 float) from EML-NET or fallback
-        num_fixations: Number of fixations to predict (default: 6)
-        ior_radius: Radius in pixels for Inhibition of Return (default: 100)
+        saliency_map: 2D numpy array (0-1 float) from EML-NET
+        num_fixations: Maximum total fixations (cap)
+        ior_radius: Radius in pixels for Inhibition of Return
         apply_reading_bias: If True, apply Western F-pattern spatial prior
+        viewport_height: Height of visible viewport (fold size)
+        fixations_per_fold: Maximum fixations per viewport/fold
         
     Returns:
-        List of fixation dicts: [{'x': int, 'y': int, 'order': int, 'duration': float, 'label': str}]
+        List of fixation dicts: [{'x': int, 'y': int, 'order': int, 'duration': float, 'fold': int}]
     """
     if saliency_map is None or saliency_map.size == 0:
         return []
@@ -1064,50 +1089,101 @@ def generate_deterministic_scanpath(saliency_map: np.ndarray,
     if working_map.max() > 1.0:
         working_map = working_map / 255.0
     
-    # --- Apply Western Reading Spatial Prior (F-Pattern Bias) ---
-    if apply_reading_bias:
-        reading_prior = generate_western_reading_prior((height, width))
-        working_map = working_map * reading_prior
+    # --- Navigation Bar Suppression ---
+    # Users don't fixate on navigation bars - they're processed peripherally.
+    # Suppress the top ~100px where nav bars typically live.
+    nav_zone_height = min(100, height // 10)  # 100px or 10% of image, whichever is smaller
+    nav_suppression = 0.15  # Reduce nav zone saliency to 15% (still visible but won't dominate)
+    working_map[:nav_zone_height, :] *= nav_suppression
+    print(f"  Nav suppression: top {nav_zone_height}px reduced to {nav_suppression*100:.0f}%")
     
-    # Store original map for duration calculation
+    # Store original map for duration calculation (before any modifications)
     original_map = working_map.copy()
     
-    fixations = []
+    # Calculate number of folds
+    num_folds = max(1, int(np.ceil(height / viewport_height)))
     
-    # --- Winner-Take-All Loop with Inhibition of Return ---
-    for i in range(num_fixations):
-        # Step 1: Find the peak (maximum intensity pixel)
-        max_val = working_map.max()
-        
-        if max_val < 0.01:  # Map is essentially empty
-            print(f"  WTA: Stopping at fixation {i+1} - saliency exhausted")
+    fixations = []
+    fixation_order = 0
+    
+    print(f"  Progressive Viewport: {num_folds} folds, {fixations_per_fold} fixations/fold, IOR radius: {ior_radius}px")
+    
+    # --- Process Each Fold Sequentially (Top to Bottom) ---
+    for fold_idx in range(num_folds):
+        if fixation_order >= num_fixations:
             break
+            
+        # Calculate fold boundaries
+        fold_start_y = fold_idx * viewport_height
+        fold_end_y = min((fold_idx + 1) * viewport_height, height)
+        fold_height = fold_end_y - fold_start_y
         
-        # Get coordinates of maximum
-        max_idx = np.unravel_index(np.argmax(working_map), working_map.shape)
-        peak_y, peak_x = int(max_idx[0]), int(max_idx[1])
+        # Create a viewport mask (only current fold is visible)
+        viewport_mask = np.zeros((height, width), dtype=np.float32)
+        viewport_mask[fold_start_y:fold_end_y, :] = 1.0
         
-        # Step 2: Calculate fixation duration (proportional to initial intensity)
-        # Base duration: 200-800ms, scaled by peak intensity
-        original_intensity = original_map[peak_y, peak_x]
-        duration = 200 + (original_intensity * 600)  # 200-800ms range
+        # Apply viewport constraint to working map
+        fold_map = working_map * viewport_mask
         
-        # Step 3: Record fixation
-        fixation = {
-            'x': peak_x,
-            'y': peak_y,
-            'order': i + 1,
-            'duration': float(round(duration, 1)),
-            'intensity': float(round(original_intensity, 3)),
-            'label': f"Fixation {i+1}"
-        }
-        fixations.append(fixation)
+        # Apply Western reading bias WITHIN this fold only
+        if apply_reading_bias and fold_height > 0:
+            # Create F-pattern bias for this fold (top-left of fold is priority)
+            y_coords = np.linspace(0, 1, height, dtype=np.float32)
+            x_coords = np.linspace(0, 1, width, dtype=np.float32)
+            y_grid, x_grid = np.meshgrid(y_coords, x_coords, indexing='ij')
+            
+            # Within-fold Y bias: favor top of current viewport
+            # Normalize y position within fold to [0, 1]
+            fold_y_bias = np.ones((height, width), dtype=np.float32)
+            for y in range(fold_start_y, fold_end_y):
+                relative_y = (y - fold_start_y) / max(1, fold_height - 1)
+                fold_y_bias[y, :] = 1.0 - (relative_y * 0.4)  # Top of fold gets 1.0, bottom gets 0.6
+            
+            # X bias: left-to-right reading (F-pattern)
+            x_bias = np.power(1.0 - x_grid, 0.3)
+            x_bias = 0.7 + 0.3 * (x_bias / x_bias.max())  # Normalize to [0.7, 1.0]
+            
+            reading_prior = fold_y_bias * x_bias
+            fold_map = fold_map * reading_prior
         
-        print(f"  WTA Fixation {i+1}: ({peak_x}, {peak_y}) | Intensity: {original_intensity:.3f} | Duration: {duration:.0f}ms")
-        
-        # Step 4: Apply Inhibition of Return
-        ior_mask = generate_inhibition_kernel((height, width), (peak_x, peak_y), ior_radius)
-        working_map = working_map * ior_mask
+        # --- WTA Loop for This Fold ---
+        fold_fixations = 0
+        while fold_fixations < fixations_per_fold and fixation_order < num_fixations:
+            # Find peak in current fold
+            max_val = fold_map.max()
+            
+            if max_val < 0.01:  # Fold exhausted
+                break
+            
+            # Get coordinates of maximum
+            max_idx = np.unravel_index(np.argmax(fold_map), fold_map.shape)
+            peak_y, peak_x = int(max_idx[0]), int(max_idx[1])
+            
+            # Calculate fixation duration (proportional to original intensity)
+            original_intensity = original_map[peak_y, peak_x]
+            duration = 200 + (original_intensity * 600)  # 200-800ms
+            
+            fixation_order += 1
+            fold_fixations += 1
+            
+            # Record fixation
+            fixation = {
+                'x': peak_x,
+                'y': peak_y,
+                'order': fixation_order,
+                'duration': float(round(duration, 1)),
+                'intensity': float(round(original_intensity, 3)),
+                'fold': fold_idx + 1,
+                'label': f"F{fold_idx + 1}.{fold_fixations}"
+            }
+            fixations.append(fixation)
+            
+            print(f"  Fold {fold_idx + 1} | Fix {fold_fixations}: ({peak_x}, {peak_y}) | Int: {original_intensity:.3f}")
+            
+            # Apply IOR to BOTH fold_map AND working_map (carries over to next folds)
+            ior_mask = generate_inhibition_kernel((height, width), (peak_x, peak_y), ior_radius)
+            fold_map = fold_map * ior_mask
+            working_map = working_map * ior_mask  # IOR persists across folds
     
     return fixations
 
@@ -1521,21 +1597,22 @@ def run_analysis(image_path: str, output_dir: str = "output",
     clarity_score = calculate_clarity_score(image)
     print(f"Clarity Score: {clarity_score:.1f}%")
     
-    # Step 10.5: Generate Deterministic Scanpath (WTA + IOR)
-    print("Generating deterministic scanpath (WTA + IOR)...")
+    # Step 10.5: Generate Deterministic Scanpath (Progressive Viewport WTA + IOR)
+    print("Generating deterministic scanpath (Progressive Viewport)...")
     
     # Calculate num_fixations: max 4 per fold/screen, capped at 50
     num_folds = max(1, int(np.ceil(height / viewport_height)))
     num_fixations = min(num_folds * 4, 50)  # Max 4 per fold, cap at 50
-    print(f"  Page has {num_folds} folds → generating up to {num_fixations} fixations")
     
     scanpath_fixations = generate_deterministic_scanpath(
         attention_mask, 
         num_fixations=num_fixations,
-        ior_radius=min(width, height) // 10,  # Smaller IOR for more fixations
-        apply_reading_bias=True
+        ior_radius=min(width, height) // 12,  # Smaller IOR for dense fixations
+        apply_reading_bias=True,
+        viewport_height=viewport_height,  # Pass viewport for fold-by-fold processing
+        fixations_per_fold=4
     )
-    print(f"Generated {len(scanpath_fixations)} fixations via WTA algorithm")
+    print(f"Generated {len(scanpath_fixations)} fixations via Progressive Viewport WTA")
     
     # Convert fixations to box format for visualization
     scanpath_boxes = scanpath_to_boxes(scanpath_fixations, box_size=60)
