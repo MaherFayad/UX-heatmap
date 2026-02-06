@@ -101,11 +101,18 @@ async def _capture_website_async(
         
         page = await context.new_page()
         
-        # Navigate to URL
-        await page.goto(url, wait_until='networkidle', timeout=30000)
+        # Navigate to URL with robust fallback strategy
+        # Use 'domcontentloaded' instead of 'networkidle' - SPAs like Linear never reach networkidle
+        # due to persistent WebSocket connections and background polling
+        try:
+            await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+        except Exception as e:
+            # If domcontentloaded fails, try with 'load' as final fallback
+            print(f"Warning: Initial navigation approach failed, retrying with 'load': {e}")
+            await page.goto(url, wait_until='load', timeout=60000)
         
-        # Wait for initial rendering
-        await page.wait_for_timeout(wait_time)
+        # Wait for initial rendering and dynamic content to settle
+        await page.wait_for_timeout(wait_time + 1000)
         
         # Scroll to bottom and back to trigger lazy loading
         await page.evaluate('''

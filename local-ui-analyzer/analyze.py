@@ -712,46 +712,196 @@ def generate_accessibility_report(image: np.ndarray,
                                 focus_score: float = 0,
                                 clarity_score: float = 0,
                                 above_fold: dict = None,
-                                scroll_analysis: list = None) -> str:
+                                scroll_analysis: dict = None,
+                                scan_path_sequence: list = None) -> str:
     """
-    Query Gemini to generate a comprehensive predictive UX/UI report
-    integrating visual attention data with accessibility standards.
+    WCAG 2.2 Accessibility Audit with Metric-Driven Analysis.
+    
+    Implements:
+    1. Metric-Audit Correlation: Clarity < 60 → Visual Noise focus; Focus < 50 → CTA saliency theft
+    2. Sequential Flow: Validates first 3 fixations include H1/primary navigation
+    3. ATF Analysis: >50% attention drop at first fold → suggest scroll cues
+    
+    Args:
+        image: Input image (BGR)
+        focus_score: Gini coefficient-based attention concentration (0-100)
+        clarity_score: Laplacian variance-based visual clarity (0-100)
+        above_fold: Dict with above/below fold attention metrics
+        scroll_analysis: List of scroll depth zones with attention percentages
+        scan_path_sequence: Ordered list of attention boxes by predicted scanpath
+        
+    Returns:
+        str: Markdown-formatted WCAG 2.2 accessibility audit report
     """
     # Convert OpenCV to PIL
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_rgb)
     
-    # Format metrics for the prompt
+    # --- Build Predictive Scanpath Sequence String ---
+    scanpath_str = "N/A"
+    hierarchy_failure_flag = ""
+    if scan_path_sequence and len(scan_path_sequence) > 0:
+        # Extract labels for first 5 fixations
+        scanpath_labels = [box.get('label', 'Unknown') for box in scan_path_sequence[:5]]
+        scanpath_str = " → ".join(scanpath_labels)
+        
+        # Check first 3 fixations for H1 or primary navigation
+        first_3_labels = [box.get('label', '').lower() for box in scan_path_sequence[:3]]
+        first_3_text = ' '.join(first_3_labels)
+        
+        hierarchy_keywords = ['h1', 'heading', 'title', 'headline', 'nav', 'navigation', 
+                             'menu', 'logo', 'brand', 'header']
+        has_hierarchy = any(keyword in first_3_text for keyword in hierarchy_keywords)
+        
+        if not has_hierarchy:
+            hierarchy_failure_flag = """
+    ⚠️ **HIERARCHY FAILURE DETECTED**: The first 3 predicted fixations do NOT include the H1, 
+    headline, or primary navigation. This indicates a broken visual hierarchy where 
+    non-essential elements are competing for initial attention."""
+    
+    # --- Build Metric-Audit Correlation Directives ---
+    audit_directives = []
+    
+    if clarity_score < 60:
+        audit_directives.append(f"""
+    🔴 **CLARITY ALERT** (Score: {clarity_score:.1f}%): 
+    The Clarity Score is below 60%, indicating high visual noise and feature congestion.
+    FOCUS YOUR AUDIT ON:
+    - Reducing decorative elements that add no functional value
+    - Consolidating redundant UI patterns
+    - Increasing whitespace between content blocks
+    - Simplifying complex visual layouts""")
+    
+    if focus_score < 50:
+        audit_directives.append(f"""
+    🔴 **FOCUS ALERT** (Score: {focus_score:.1f}%): 
+    The Focus Score is below 50%, indicating saliency is scattered across non-functional elements.
+    IDENTIFY WHICH ELEMENTS ARE "STEALING" ATTENTION FROM THE PRIMARY CTA:
+    - Large imagery that overshadows action buttons
+    - Competing secondary CTAs or promotional banners
+    - Animated elements or auto-playing media
+    - Dense navigation menus above the fold""")
+    
+    audit_directive_text = "\n".join(audit_directives) if audit_directives else "No critical metric alerts."
+    
+    # --- Build ATF Retention Analysis ---
+    atf_analysis = ""
+    retention_curve_data = ""
+    
+    if above_fold:
+        atf_pct = above_fold.get('above_fold_attention_pct', 0)
+        btf_pct = above_fold.get('below_fold_attention_pct', 0)
+        
+        # Calculate attention drop at first fold
+        if atf_pct > 0 and btf_pct > 0:
+            attention_drop = ((atf_pct - btf_pct) / atf_pct) * 100 if atf_pct > atf_pct else 0
+        else:
+            attention_drop = 0
+            
+        if atf_pct < 50:  # Attention concentration below fold
+            atf_analysis = f"""
+    ⚠️ **ATF ATTENTION WARNING**: Only {atf_pct:.1f}% of attention is above the fold.
+    RECOMMENDATIONS:
+    - Add stronger visual hooks in the hero section
+    - Consider a more compelling value proposition above the fold
+    - Add a scroll indicator or visual bridge to below-fold content"""
+    
+    # Build retention curve from scroll_analysis
+    if scroll_analysis and 'zones' in scroll_analysis:
+        zones = scroll_analysis['zones']
+        if len(zones) >= 2:
+            first_zone_attn = zones[0].get('attention_pct', 100)
+            second_zone_attn = zones[1].get('attention_pct', 0) if len(zones) > 1 else 0
+            
+            if first_zone_attn > 0:
+                drop_pct = ((first_zone_attn - second_zone_attn) / first_zone_attn) * 100
+                
+                if drop_pct > 50:
+                    atf_analysis += f"""
+    🔴 **SCROLL CLIFF DETECTED**: Attention drops by {drop_pct:.0f}% at the first fold.
+    This indicates users may abandon the page before seeing key content.
+    SUGGEST:
+    - Add "Scroll Cues" (animated arrows, partial content previews)
+    - Implement "Visual Bridges" (elements that span the fold)
+    - Consider repositioning critical CTAs higher on the page"""
+            
+            # Format retention curve for prompt
+            curve_data = [{"zone": z['name'], "attention": z['attention_pct'], 
+                          "visibility": z.get('visibility_pct', 100)} for z in zones]
+            retention_curve_data = f"\n    - Retention Curve Data: {json.dumps(curve_data, indent=2)}"
+    
+    # --- Build Complete Metrics Context ---
     metrics_context = f"""
-    QUANTITATIVE DATA (from Attention Analysis):
-    - Focus Score: {focus_score:.1f}% (Heatmap Concentration + UI Capture. >50% is good)
-    - Clarity Score: {clarity_score:.1f}% (Visual Cleanliness/Low Clutter. >60% is good)
-    - Above the Fold Attention: {above_fold['above_fold_attention_pct'] if above_fold else 0}%
-    - Attention by Scroll Depth: {json.dumps(scroll_analysis, indent=2) if scroll_analysis else 'N/A'}
+    QUANTITATIVE DATA (Attention Analysis Engine):
+    ═══════════════════════════════════════════════
+    • Focus Score (Gini Coeff): {focus_score:.1f}% 
+      → Measures attention concentration. <50% = scattered, >70% = focused
+    • Clarity Score (Laplacian Var): {clarity_score:.1f}%
+      → Measures visual cleanliness. <60% = cluttered, >75% = clean
+    • Above-the-Fold Attention: {above_fold.get('above_fold_attention_pct', 0) if above_fold else 'N/A'}%
+    • Predictive Scanpath: {scanpath_str}
+    {retention_curve_data}
+    
+    ═══════════════════════════════════════════════
+    AUDIT DIRECTIVES (Auto-Generated from Metrics):
+    ═══════════════════════════════════════════════
+    {audit_directive_text}
+    {hierarchy_failure_flag}
+    {atf_analysis}
     """
     
-    prompt = f"""Act as a Senior UX Researcher & Cognitive Scientist.
-Analyze this UI screenshot and the provided attention metrics to generate a "Predictive Attention & Accessibility Report".
+    prompt = f"""### ROLE
+You are a Senior WCAG 2.2 Accessibility Auditor and UX Strategist.
+
+### CONTEXT
+You are auditing a UI based on raw screenshots and new quantitative data provided below.
 
 {metrics_context}
 
-Evaluate the design based on:
-1. **Cognitive Load & Clarity**: 
-   - Does the Clarity Score ({clarity_score:.1f}%) suggest the design is clean or cluttered? 
-   - Does the Focus Score ({focus_score:.1f}%) show that users are finding key elements efficiently?
-2. **Visual Hierarchy & Scroll**: detailed critique of how attention flows down the page. Is the above-fold attention adequate?
-3. **Accessibility & Contrast**: Identify specific WCAG failures (colors, font sizes).
-4. **Conversion Optimization**: Are the key CTAs receiving attention?
+### AUDIT DIRECTIVES
+1. **Metric-Audit Correlation**: 
+   - If Clarity < 60%, focus your "Recommendations" on reducing "Visual Noise" and "Feature Congestion".
+   - If Focus < 50%, identify which non-functional elements are "stealing" saliency from the Primary CTA.
+2. **Sequential Flow**:
+   - Evaluate the Predictive Scanpath. If the user's first 3 fixations do not include the H1 or a primary navigation element, flag it as a "Hierarchy Failure."
+3. **Above the Fold (ATF) Analysis**:
+   - Analyze the Retention Curve. If attention drops by >50% at the first fold, suggest "Scroll Cues" or "Visual Bridges."
 
-Provide a professional, actionable report with these sections:
-- **Executive Summary**
-- **Attention & Clarity Analysis** (Cite the data)
-- **Accessibility & Clarity**
-- **Recommendations**
+### OUTPUT FORMAT
+Generate a comprehensive WCAG 2.2 Accessibility Audit with these sections:
 
-Format with Markdown. 
-IMPORTANT: Return ONLY the markdown content. Do NOT include any conversational filler like "Here is the report" or "As an AI". Start directly with the # Report Title or ## Section.
-"""
+## Executive Summary
+Brief 2-3 sentence overview of the UI's attention and accessibility health.
+
+## Metrics Dashboard
+| Metric | Value | Status |
+|--------|-------|--------|
+| Focus Score | {focus_score:.1f}% | [PASS/WARNING/FAIL] |
+| Clarity Score | {clarity_score:.1f}% | [PASS/WARNING/FAIL] |
+| ATF Attention | {above_fold.get('above_fold_attention_pct', 0) if above_fold else 'N/A'}% | [PASS/WARNING/FAIL] |
+
+## Attention & Hierarchy Analysis
+- Analyze the predicted scanpath
+- Flag any hierarchy failures
+- Evaluate CTA visibility
+
+## WCAG 2.2 Accessibility Audit
+### Color Contrast (1.4.3, 1.4.6)
+### Text Readability (1.4.4, 1.4.12)
+### Target Size (2.5.5, 2.5.8)
+### Focus Indicators (2.4.7, 2.4.11)
+
+## Above-the-Fold & Scroll Analysis
+- ATF content effectiveness
+- Scroll incentives present/missing
+- Visual bridge recommendations
+
+## Prioritized Recommendations
+1. [Critical - must fix]
+2. [High - should fix]
+3. [Medium - consider fixing]
+
+IMPORTANT: Return ONLY the markdown content. Do NOT include any conversational filler like "Here is the report" or "As an AI". Start directly with ## Executive Summary."""
 
     try:
         response = client.models.generate_content(
@@ -813,6 +963,185 @@ def analyze_above_fold(image: np.ndarray, boxes: list[dict],
     }
 
 
+def generate_western_reading_prior(shape: tuple) -> np.ndarray:
+    """
+    Generate a "Western Reading Gravity" spatial prior mask.
+    
+    Implements an F-pattern bias that weights the top-left quadrant higher,
+    decaying towards the bottom-right. This ensures that if two elements 
+    have equal saliency, the user "reads" the top-left one first.
+    
+    Returns:
+        np.ndarray: Spatial prior mask (0-1 float32)
+    """
+    height, width = shape
+    
+    # Create coordinate grids normalized to [0, 1]
+    y_coords = np.linspace(0, 1, height, dtype=np.float32)
+    x_coords = np.linspace(0, 1, width, dtype=np.float32)
+    
+    # Generate 2D grids
+    y_grid, x_grid = np.meshgrid(y_coords, x_coords, indexing='ij')
+    
+    # Western reading bias: Higher weight for top-left, decaying to bottom-right
+    # F-pattern formula: (1 - x)^0.3 * (1 - y)^0.5
+    # x-decay is gentler (exponent 0.3) because horizontal reading is natural
+    # y-decay is steeper (exponent 0.5) because vertical scrolling requires effort
+    x_bias = np.power(1.0 - x_grid, 0.3)
+    y_bias = np.power(1.0 - y_grid, 0.5)
+    
+    # Combine biases
+    spatial_prior = x_bias * y_bias
+    
+    # Normalize to [0.5, 1.0] range to avoid over-suppression
+    # This is a "soft" bias, not a hard mask
+    spatial_prior = 0.5 + 0.5 * (spatial_prior / spatial_prior.max())
+    
+    return spatial_prior.astype(np.float32)
+
+
+def generate_inhibition_kernel(shape: tuple, center: tuple, radius: int = 100) -> np.ndarray:
+    """
+    Generate an Inhibition of Return (IOR) kernel.
+    
+    Creates an inverted Gaussian mask centered at the fixation point to 
+    suppress already-attended regions.
+    
+    Args:
+        shape: (height, width) of the saliency map
+        center: (x, y) coordinate of the fixation point
+        radius: Radius of the inhibition zone in pixels
+        
+    Returns:
+        np.ndarray: IOR mask (0-1 float32) where 0 = fully inhibited
+    """
+    height, width = shape
+    cx, cy = center
+    
+    # Create coordinate grids
+    y, x = np.ogrid[:height, :width]
+    
+    # Calculate Euclidean distance from center
+    distance = np.sqrt((x - cx)**2 + (y - cy)**2)
+    
+    # Gaussian inhibition: 1 at edges (no inhibition), 0 at center (full inhibition)
+    sigma = radius / 2.5  # Controls the spread of inhibition
+    ior_mask = 1.0 - np.exp(-(distance**2) / (2 * sigma**2))
+    
+    return ior_mask.astype(np.float32)
+
+
+def generate_deterministic_scanpath(saliency_map: np.ndarray, 
+                                    num_fixations: int = 6,
+                                    ior_radius: int = 100,
+                                    apply_reading_bias: bool = True) -> list[dict]:
+    """
+    Generate a deterministic scanpath using Winner-Take-All (WTA) with 
+    Inhibition of Return (IOR).
+    
+    This replaces VLM-based guessing with a pixel-perfect algorithm that:
+    1. Finds the maximum saliency peak
+    2. Records it as a fixation
+    3. Applies IOR to suppress that region
+    4. Repeats until num_fixations is reached
+    
+    Args:
+        saliency_map: 2D numpy array (0-1 float) from EML-NET or fallback
+        num_fixations: Number of fixations to predict (default: 6)
+        ior_radius: Radius in pixels for Inhibition of Return (default: 100)
+        apply_reading_bias: If True, apply Western F-pattern spatial prior
+        
+    Returns:
+        List of fixation dicts: [{'x': int, 'y': int, 'order': int, 'duration': float, 'label': str}]
+    """
+    if saliency_map is None or saliency_map.size == 0:
+        return []
+    
+    height, width = saliency_map.shape[:2]
+    
+    # Ensure saliency map is float32 and normalized
+    working_map = saliency_map.astype(np.float32).copy()
+    if working_map.max() > 1.0:
+        working_map = working_map / 255.0
+    
+    # --- Apply Western Reading Spatial Prior (F-Pattern Bias) ---
+    if apply_reading_bias:
+        reading_prior = generate_western_reading_prior((height, width))
+        working_map = working_map * reading_prior
+    
+    # Store original map for duration calculation
+    original_map = working_map.copy()
+    
+    fixations = []
+    
+    # --- Winner-Take-All Loop with Inhibition of Return ---
+    for i in range(num_fixations):
+        # Step 1: Find the peak (maximum intensity pixel)
+        max_val = working_map.max()
+        
+        if max_val < 0.01:  # Map is essentially empty
+            print(f"  WTA: Stopping at fixation {i+1} - saliency exhausted")
+            break
+        
+        # Get coordinates of maximum
+        max_idx = np.unravel_index(np.argmax(working_map), working_map.shape)
+        peak_y, peak_x = int(max_idx[0]), int(max_idx[1])
+        
+        # Step 2: Calculate fixation duration (proportional to initial intensity)
+        # Base duration: 200-800ms, scaled by peak intensity
+        original_intensity = original_map[peak_y, peak_x]
+        duration = 200 + (original_intensity * 600)  # 200-800ms range
+        
+        # Step 3: Record fixation
+        fixation = {
+            'x': peak_x,
+            'y': peak_y,
+            'order': i + 1,
+            'duration': float(round(duration, 1)),
+            'intensity': float(round(original_intensity, 3)),
+            'label': f"Fixation {i+1}"
+        }
+        fixations.append(fixation)
+        
+        print(f"  WTA Fixation {i+1}: ({peak_x}, {peak_y}) | Intensity: {original_intensity:.3f} | Duration: {duration:.0f}ms")
+        
+        # Step 4: Apply Inhibition of Return
+        ior_mask = generate_inhibition_kernel((height, width), (peak_x, peak_y), ior_radius)
+        working_map = working_map * ior_mask
+    
+    return fixations
+
+
+def scanpath_to_boxes(fixations: list[dict], box_size: int = 60) -> list[dict]:
+    """
+    Convert scanpath fixations to box format for compatibility with existing functions.
+    
+    Args:
+        fixations: List from generate_deterministic_scanpath
+        box_size: Size of the attention box around each fixation
+        
+    Returns:
+        List of box dicts compatible with existing pipeline
+    """
+    boxes = []
+    half_size = box_size // 2
+    
+    for fix in fixations:
+        box = {
+            'x': max(0, fix['x'] - half_size),
+            'y': max(0, fix['y'] - half_size),
+            'w': box_size,
+            'h': box_size,
+            'label': fix.get('label', f"Fixation {fix['order']}"),
+            'order': fix['order'],
+            'duration': fix.get('duration', 300),
+            'type': 'focal'
+        }
+        boxes.append(box)
+    
+    return boxes
+
+
 def sort_boxes_by_reading_order(boxes: list[dict]) -> list[dict]:
     """
     Sort boxes in approximate reading order (Z-pattern / F-pattern).
@@ -826,9 +1155,6 @@ def sort_boxes_by_reading_order(boxes: list[dict]) -> list[dict]:
     boxes_copy = [b.copy() for b in boxes]
     
     # Calculate centroids and dynamic band height
-    # Use 10% of image height or 50px as default band height if passed
-    # but we don't have image height here easily unless we inspect boxes or pass it in.
-    # Let's infer approximate scale from the boxes range.
     min_y = min(b['y'] for b in boxes_copy) if boxes_copy else 0
     max_y = max(b['y'] + b['h'] for b in boxes_copy) if boxes_copy else 1000
     total_height = max_y - min_y
@@ -841,22 +1167,13 @@ def sort_boxes_by_reading_order(boxes: list[dict]) -> list[dict]:
     def get_centroid(b):
         return (b['x'] + b['w'] // 2, b['y'] + b['h'] // 2)
 
-    # We sort by:
-    # 1. Y-Band of CENTROID -> Robust row grouping
-    # 2. X coordinate of CENTROID -> Left to Right reading
-    
+    # Sort by: Y-Band of CENTROID -> X coordinate of CENTROID
     def sort_key(box):
         cx, cy = get_centroid(box)
         y_band = cy // band_height
         return (y_band, cx)
         
     boxes_copy.sort(key=sort_key)
-    
-    # Debug print to understand sorting
-    print(f"DEBUG: Sorting boxes with band_height={band_height}")
-    for i, b in enumerate(boxes_copy):
-        cx, cy = get_centroid(b)
-        print(f"  Box {i+1}: cy={cy} (Band {cy // band_height}), cx={cx} -> Label: {b.get('label', '?')}")
         
     return boxes_copy
 
@@ -1162,9 +1479,8 @@ def run_analysis(image_path: str, output_dir: str = "output",
         
     aoi_image = generate_aoi_image(image, boxes)
     
-    # Step 3.5: Generate Scanpath (New)
-    print("Generating scanpath visualization...")
-    scanpath_image = generate_scanpath_visualization(image, boxes)
+    # Note: Scanpath visualization is now generated later using deterministic WTA algorithm
+    # (Step 10.5) instead of VLM-based box sorting
     
     # Step 3 (Skipped): Generate contrast map
     # print("Generating contrast map...")
@@ -1191,11 +1507,10 @@ def run_analysis(image_path: str, output_dir: str = "output",
     
     # Step 8.5: Apply Fold Line to ALL images
     print("Applying fold line to all visualizations...")
-    # Note: scroll_depth_image gets its own special folds in generation, so we skip it here to avoid double drawing
+    # Note: scroll_depth_image and scanpath_image get fold lines applied after generation
     image_with_fold = draw_fold_line(image.copy(), fold_y, above_fold_analysis)
     attention_with_fold = draw_fold_line(attention_heatmap, fold_y, above_fold_analysis)
     aoi_with_fold = draw_fold_line(aoi_image, fold_y, above_fold_analysis)
-    scanpath_with_fold = draw_fold_line(scanpath_image, fold_y, above_fold_analysis)
     
     # Step 9: Generate scroll depth visualization
     print("Generating scroll depth visualization...")
@@ -1205,14 +1520,40 @@ def run_analysis(image_path: str, output_dir: str = "output",
     print("Calculating clarity score...")
     clarity_score = calculate_clarity_score(image)
     print(f"Clarity Score: {clarity_score:.1f}%")
+    
+    # Step 10.5: Generate Deterministic Scanpath (WTA + IOR)
+    print("Generating deterministic scanpath (WTA + IOR)...")
+    
+    # Calculate num_fixations: max 4 per fold/screen, capped at 50
+    num_folds = max(1, int(np.ceil(height / viewport_height)))
+    num_fixations = min(num_folds * 4, 50)  # Max 4 per fold, cap at 50
+    print(f"  Page has {num_folds} folds → generating up to {num_fixations} fixations")
+    
+    scanpath_fixations = generate_deterministic_scanpath(
+        attention_mask, 
+        num_fixations=num_fixations,
+        ior_radius=min(width, height) // 10,  # Smaller IOR for more fixations
+        apply_reading_bias=True
+    )
+    print(f"Generated {len(scanpath_fixations)} fixations via WTA algorithm")
+    
+    # Convert fixations to box format for visualization
+    scanpath_boxes = scanpath_to_boxes(scanpath_fixations, box_size=60)
+    
+    # Re-generate scanpath visualization with deterministic fixations
+    scanpath_image = generate_scanpath_visualization(image, scanpath_boxes)
+    scanpath_with_fold = draw_fold_line(scanpath_image, fold_y, above_fold_analysis)
 
-    # Step 11: Generate accessibility report
-    print("Generating accessibility report...")
-    accessibility_report = generate_accessibility_report(image,
-                                                      focus_score=focus_score,
-                                                      clarity_score=clarity_score,
-                                                      above_fold=above_fold_analysis,
-                                                      scroll_analysis=scroll_analysis)
+    # Step 11: Generate accessibility report with scanpath sequence
+    print("Generating WCAG 2.2 accessibility report...")
+    accessibility_report = generate_accessibility_report(
+        image,
+        focus_score=focus_score,
+        clarity_score=clarity_score,
+        above_fold=above_fold_analysis,
+        scroll_analysis=scroll_analysis,
+        scan_path_sequence=scanpath_boxes  # Pass deterministic scanpath
+    )
     
     # Save images
     print("Saving analysis images...")
@@ -1240,8 +1581,10 @@ def run_analysis(image_path: str, output_dir: str = "output",
         'fold': img_to_base64_data_uri(image_with_fold),
         'scroll_depth': img_to_base64_data_uri(scroll_depth_image),
         'focus_score': focus_score,
+        'clarity_score': clarity_score,
         'above_fold_analysis': above_fold_analysis,
         'scroll_analysis': scroll_analysis,
+        'scanpath_fixations': scanpath_fixations,  # Include raw fixation data
         'accessibility_report': accessibility_report,
         'boxes': boxes,
         'image_path': os.path.basename(image_path),

@@ -71,7 +71,11 @@ class SaliencyEngine:
 
     def predict(self, image_numpy):
         """
-        Predict saliency map using sliding window for tall images to preserve details.
+        Predict saliency map using high-fidelity sliding window inference.
+        
+        Uses dynamic rescaling for Desktop (1920px) and Mobile (375px) screenshots,
+        Lanczos resampling for edge preservation, and 2D Hanning window blending
+        with 25% overlap for seam-free tile fusion.
         
         Args:
             image_numpy: Input image (BGR) from OpenCV.
@@ -88,57 +92,113 @@ class SaliencyEngine:
             # Model expects 4:3 input (640x480)
             model_w, model_h = 640, 480
             
-            # Check if image is "tall" (e.g. height > 1.2 * width)
-            # If so, use sliding window to avoid squashing
-            if h > 1.2 * w:
-                print(f"  Detected tall image ({w}x{h}). Using sliding window inference...")
-                
-                # Determine window size in the source image
-                # We want a 4:3 window that fits the width
+            # --- Dynamic Rescaling ---
+            # Desktop (width >= 640): use 640px window
+            # Mobile (width < 640): use full image width
+            if w >= 640:
+                window_w = 640
+            else:
                 window_w = w
-                window_h = int(w * (model_h / model_w)) # Maintain aspect ratio
+            
+            # Maintain 4:3 aspect ratio for EML-NET input
+            window_h = int(window_w * (3.0 / 4.0))
+            
+            # Check if sliding window is needed
+            # Use sliding window if image height exceeds a single window
+            needs_sliding = h > window_h
+            
+            if needs_sliding:
+                print(f"  High-fidelity sliding window ({w}x{h}). Window: {window_w}x{window_h}")
                 
-                stride = int(window_h * 0.5) # 50% overlap for smoother blending
+                # --- 25% Overlap Stride ---
+                stride_x = int(window_w * 0.75)
+                stride_y = int(window_h * 0.75)
                 
-                # Accumulators
+                # Accumulators in float32 to prevent quantization noise
                 full_saliency = np.zeros((h, w), dtype=np.float32)
-                counts = np.zeros((h, w), dtype=np.float32)
+                weight_accumulator = np.zeros((h, w), dtype=np.float32)
                 
-                # Sliding window loop
-                for y in range(0, h, stride):
-                    # Define crop
+                # --- Pre-compute 2D Hanning Window Kernel ---
+                hanning_y = np.hanning(window_h).astype(np.float32)
+                hanning_x = np.hanning(window_w).astype(np.float32)
+                hanning_2d = np.outer(hanning_y, hanning_x)
+                
+                # --- Sliding Window Loop (both X and Y) ---
+                y = 0
+                while y < h:
+                    # Compute vertical bounds
                     end_y = min(y + window_h, h)
-                    start_y = max(0, end_y - window_h) # Ensure fixed height at bottom
+                    start_y = end_y - window_h
+                    if start_y < 0:
+                        start_y = 0
+                        end_y = min(window_h, h)
                     
-                    crop = image_numpy[start_y:end_y, 0:w]
+                    actual_h = end_y - start_y
                     
-                    # Predict on crop
-                    pred_map = self._predict_single(crop) # Returns 0-1 float
+                    x = 0
+                    while x < w:
+                        # Compute horizontal bounds
+                        end_x = min(x + window_w, w)
+                        start_x = end_x - window_w
+                        if start_x < 0:
+                            start_x = 0
+                            end_x = min(window_w, w)
+                        
+                        actual_w = end_x - start_x
+                        
+                        # Extract tile
+                        tile = image_numpy[start_y:end_y, start_x:end_x]
+                        
+                        # Predict on tile
+                        pred_map = self._predict_single(tile)  # Returns 0-1 float
+                        
+                        # Resize prediction back to tile size using Lanczos
+                        pred_map_resized = cv2.resize(
+                            pred_map, 
+                            (actual_w, actual_h), 
+                            interpolation=cv2.INTER_LANCZOS4
+                        )
+                        
+                        # Get appropriate Hanning window slice
+                        if actual_h == window_h and actual_w == window_w:
+                            weight_kernel = hanning_2d
+                        else:
+                            # Recompute for edge tiles with different dimensions
+                            edge_hanning_y = np.hanning(actual_h).astype(np.float32)
+                            edge_hanning_x = np.hanning(actual_w).astype(np.float32)
+                            weight_kernel = np.outer(edge_hanning_y, edge_hanning_x)
+                        
+                        # Accumulate weighted prediction
+                        full_saliency[start_y:end_y, start_x:end_x] += pred_map_resized * weight_kernel
+                        weight_accumulator[start_y:end_y, start_x:end_x] += weight_kernel
+                        
+                        # Move to next horizontal tile
+                        if end_x >= w:
+                            break
+                        x += stride_x
                     
-                    # Resize back to crop size (should be minor)
-                    pred_map_resized = cv2.resize(pred_map, (w, end_y - start_y))
-                    
-                    # Apply Gaussian window weighting to reduce edge artifacts
-                    # Simple center weighting
-                    # Y-weighting
-                    weight_y = np.hanning(end_y - start_y)
-                    # X-weighting
-                    weight_x = np.hanning(w)
-                    weight_map = np.outer(weight_y, weight_x)
-                    
-                    full_saliency[start_y:end_y, 0:w] += pred_map_resized * weight_map
-                    counts[start_y:end_y, 0:w] += weight_map
+                    # Move to next vertical tile
+                    if end_y >= h:
+                        break
+                    y += stride_y
                 
-                # Average
-                final_map = np.divide(full_saliency, counts + 1e-8)
+                # --- Final Normalization (single pass to avoid quantization) ---
+                final_map = np.divide(
+                    full_saliency, 
+                    weight_accumulator + 1e-8, 
+                    dtype=np.float32
+                )
                 
             else:
-                # Standard inference for normal images
+                # Standard inference for images fitting in single window
                 final_map = self._predict_single(image_numpy)
-                # Resize to original
-                final_map = cv2.resize(final_map, (w, h), interpolation=cv2.INTER_CUBIC)
+                # Resize to original using Lanczos
+                final_map = cv2.resize(
+                    final_map, (w, h), 
+                    interpolation=cv2.INTER_LANCZOS4
+                )
 
-            # Normalize final output
+            # Normalize final output (0-1 range, then scale to 0-255)
             final_map = (final_map - final_map.min()) / (final_map.max() - final_map.min() + 1e-8)
             return (final_map * 255).astype(np.uint8)
 
@@ -149,25 +209,39 @@ class SaliencyEngine:
             return None
 
     def _predict_single(self, image_numpy):
-        """Helper for single-pass prediction. Returns 0-1 float map."""
+        """
+        Single-pass prediction with Lanczos resampling for high-fidelity downscaling.
+        
+        Returns 0-1 float map.
+        """
+        h, w = image_numpy.shape[:2]
         img_rgb = cv2.cvtColor(image_numpy, cv2.COLOR_BGR2RGB)
         
+        # --- Lanczos Resampling for Downscaling ---
+        # Resize to model input (640x480) using Lanczos to preserve UI edges
+        img_resized = cv2.resize(
+            img_rgb, 
+            (640, 480), 
+            interpolation=cv2.INTER_LANCZOS4
+        )
+        
+        # Convert to tensor with normalization
         transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((480, 640)), 
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )
         ])
         
-        img_tensor = transform(img_rgb).unsqueeze(0).to(self.device)
+        img_tensor = transform(img_resized).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             output = self.model(img_tensor)
             
-        saliency_map = output.squeeze().cpu().numpy() # Raw logits or sigmoid
+        saliency_map = output.squeeze().cpu().numpy()  # Raw logits or sigmoid
         
         # Normalize 0-1 locally
         saliency_map = (saliency_map - saliency_map.min()) / (saliency_map.max() - saliency_map.min() + 1e-8)
         
-        return saliency_map
+        return saliency_map.astype(np.float32)
