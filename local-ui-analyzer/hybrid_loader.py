@@ -79,33 +79,47 @@ class HybridDataset(Dataset):
     # Source labels for tracking dataset origin
     SILICON_LABEL = 0
     UEYES_LABEL = 1
+    MASSVIS_LABEL = 2
+    FIWI_LABEL = 3
     
     def __init__(
         self,
         silicon_root: str,
         ueyes_root: str,
+        massvis_root: Optional[str] = None,
+        fiwi_root: Optional[str] = None,
+        salchart_root: Optional[str] = None,
         split: str = 'train',
         transform: Optional[A.Compose] = None
     ):
-        self.silicon_root = Path(silicon_root)
-        self.ueyes_root = Path(ueyes_root)
+        self.silicon_root = Path(silicon_root) if silicon_root else None
+        self.ueyes_root = Path(ueyes_root) if ueyes_root else None
+        self.massvis_root = Path(massvis_root) if massvis_root else None
+        self.fiwi_root = Path(fiwi_root) if fiwi_root else None
+        self.salchart_root = Path(salchart_root) if salchart_root else None
+        
         self.split = split
         self.transform = transform or get_transforms(is_train=(split == 'train'))
         self.map_transform = get_map_transforms()
         
-        # Collect samples from both datasets
+        # Collect samples from all datasets
         self.samples: List[Tuple[Path, Path, int]] = []  # (image_path, map_path, source_label)
         self.silicon_count = 0
         self.ueyes_count = 0
+        self.massvis_count = 0
+        self.fiwi_count = 0
+        self.salchart_count = 0
         
-        # Load Silicon samples
-        self._load_silicon_samples()
+        # Load samples
+        if self.silicon_root: self._load_silicon_samples()
+        if self.ueyes_root: self._load_ueyes_samples()
+        if self.massvis_root: self._load_massvis_samples()
+        if self.fiwi_root: self._load_mobile_ui_samples()
+        if self.salchart_root: self._load_salchart_samples()
         
-        # Load Ueyes samples  
-        self._load_ueyes_samples()
-        
-        print(f"[HybridDataset] Loaded {self.silicon_count} Silicon + {self.ueyes_count} Ueyes = {len(self.samples)} total samples")
-    
+        print(f"[HybridDataset] Loaded: Silicon={self.silicon_count}, Ueyes={self.ueyes_count}, "
+              f"MassVis={self.massvis_count}, FiWI={self.fiwi_count}, SalChart={self.salchart_count}. Total={len(self.samples)}")
+
     def _load_silicon_samples(self):
         """Load samples from Silicon dataset (nested train/val structure)."""
         print("[HybridDataset] Scanning Silicon dataset...")
@@ -125,15 +139,10 @@ class HybridDataset(Dataset):
             images_dir = images_root / subdir
             maps_dir = maps_root / subdir
             
-            if not images_dir.exists():
-                warnings.warn(f"Silicon images directory not found: {images_dir}")
+            if not images_dir.exists() or not maps_dir.exists():
                 continue
             
-            if not maps_dir.exists():
-                warnings.warn(f"Silicon maps directory not found: {maps_dir}")
-                continue
-            
-            # Build map lookup (basename without extension -> full path)
+            # Build map lookup
             map_lookup = {}
             for map_file in maps_dir.iterdir():
                 if map_file.is_file() and map_file.suffix.lower() in ['.png', '.jpg', '.jpeg']:
@@ -141,49 +150,36 @@ class HybridDataset(Dataset):
             
             # Match images to maps
             for img_file in images_dir.iterdir():
-                if not img_file.is_file():
-                    continue
-                if img_file.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
+                if not img_file.is_file() or img_file.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
                     continue
                 
                 basename = img_file.stem.lower()
                 if basename in map_lookup:
                     self.samples.append((img_file, map_lookup[basename], self.SILICON_LABEL))
                     self.silicon_count += 1
-                else:
-                    # Skip silently for efficiency (common in large datasets)
-                    pass
-    
+
     def _load_ueyes_samples(self):
-        """Load samples from Ueyes dataset (flat structure but maps in subfolders)."""
+        """Load samples from Ueyes dataset."""
         print("[HybridDataset] Scanning Ueyes dataset...")
         images_dir = self.ueyes_root / "images"
         
         # Maps are located in subfolders (heatmaps_7s is standard GT)
-        # We prefer heatmaps_7s, but check others if missing
         potential_map_dirs = [
             self.ueyes_root / "saliency_maps" / "heatmaps_7s",
             self.ueyes_root / "saliency_maps" / "heatmaps_3s",
-            self.ueyes_root / "saliency_maps" / "heatmaps_1s",
-            self.ueyes_root / "saliency_maps"  # Fallback to root if user reorganized
+            self.ueyes_root / "saliency_maps"
         ]
         
         maps_dir = None
         for p_dir in potential_map_dirs:
             if p_dir.exists():
                 maps_dir = p_dir
-                print(f"[Ueyes] Using map directory: {maps_dir}")
                 break
         
-        if not images_dir.exists():
-            warnings.warn(f"Ueyes images directory not found: {images_dir}")
+        if not images_dir.exists() or maps_dir is None:
             return
         
-        if maps_dir is None:
-            warnings.warn(f"Ueyes saliency_maps directory not found (checked heatmaps_7s/3s/1s/root)")
-            return
-        
-        # Build map lookup (basename without extension -> full path)
+        # Build map lookup
         map_lookup = {}
         for map_file in maps_dir.iterdir():
             if map_file.is_file() and map_file.suffix.lower() in ['.png', '.jpg', '.jpeg']:
@@ -191,124 +187,133 @@ class HybridDataset(Dataset):
         
         # Match images to maps
         for img_file in images_dir.iterdir():
-            if not img_file.is_file():
-                continue
-            if img_file.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
+            if not img_file.is_file() or img_file.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
                 continue
             
             basename = img_file.stem.lower()
             if basename in map_lookup:
                 self.samples.append((img_file, map_lookup[basename], self.UEYES_LABEL))
                 self.ueyes_count += 1
-            else:
-                warnings.warn(f"[Ueyes] Missing map for: {img_file.name}")
-    
+
+    def _load_massvis_samples(self):
+        """Load MassVis samples (Stub - Saliency maps currently missing)."""
+        print("[HybridDataset] Scanning MassVis dataset...")
+        if not self.massvis_root:
+            return
+            
+        # Placeholder for when maps are available
+        # Structure identified: vis1/, vis2/, vis3/ contain stimulus.
+        # Targets/ contain stimulus.
+        pass
+
+    def _load_salchart_samples(self):
+        """Load SALchart QA samples (Stub - Stimulus images currently missing)."""
+        print("[HybridDataset] Scanning SALchart QA dataset...")
+        # Placeholder for when stimulus images are available
+        pass
+
+    def _load_mobile_ui_samples(self):
+        """Load Mobile UI Saliency samples."""
+        print("[HybridDataset] Scanning Mobile UI Saliency dataset...")
+        if not self.fiwi_root:
+             return
+
+        images_dir = self.fiwi_root / "ui_screenshots"
+        maps_dir = self.fiwi_root / "density_maps"
+        
+        if not images_dir.exists() or not maps_dir.exists():
+            warnings.warn(f"Mobile UI folders not found: {images_dir} or {maps_dir}")
+            return
+            
+        # Map lookup: filenames usually match
+        map_lookup = {p.stem.lower(): p for p in maps_dir.glob("*") if p.suffix.lower() in ['.png','.jpg','.jpeg']}
+        
+        count = 0
+        for img_file in images_dir.glob("*"):
+             if img_file.suffix.lower() in ['.png', '.jpg', '.jpeg']:
+                if img_file.stem.lower() in map_lookup:
+                    self.samples.append((img_file, map_lookup[img_file.stem.lower()], self.FIWI_LABEL))
+                    count += 1
+        
+        self.fiwi_count = count
+        print(f"[Mobile UI] Loaded {count} samples")
+
     def __len__(self) -> int:
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """
-        Get a sample by index.
-        
-        Returns:
-            Tuple of (image_tensor, map_tensor, source_label)
-            - image_tensor: (3, H, W) normalized RGB tensor
-            - map_tensor: (1, H, W) grayscale saliency map [0, 1]
-            - source_label: 0 for Silicon, 1 for Ueyes
-        """
         img_path, map_path, source_label = self.samples[idx]
-        
         try:
-            # Load image as RGB
             image = Image.open(img_path).convert('RGB')
             image = np.array(image)
             
-            # Load map as grayscale
             saliency_map = Image.open(map_path).convert('L')
-            saliency_map = np.array(saliency_map).astype(np.float32) / 255.0  # Normalize to [0, 1]
+            saliency_map = np.array(saliency_map).astype(np.float32) / 255.0
             
-            # Apply transforms
             transformed = self.transform(image=image)
             image_tensor = transformed['image']
             
             map_transformed = self.map_transform(image=saliency_map)
             map_tensor = map_transformed['image']
             
-            # Ensure map is (1, H, W)
             if map_tensor.dim() == 2:
                 map_tensor = map_tensor.unsqueeze(0)
             
             return image_tensor, map_tensor, source_label
-            
         except Exception as e:
-            warnings.warn(f"Error loading sample {idx} ({img_path}): {e}")
-            # Return a dummy sample to avoid crashing
-            dummy_img = torch.zeros(3, TARGET_HEIGHT, TARGET_WIDTH)
-            dummy_map = torch.zeros(1, TARGET_HEIGHT, TARGET_WIDTH)
-            return dummy_img, dummy_map, source_label
+            warnings.warn(f"Error loading sample {idx}: {e}")
+            return torch.zeros(3, TARGET_HEIGHT, TARGET_WIDTH), torch.zeros(1, TARGET_HEIGHT, TARGET_WIDTH), source_label
 
 
 def get_balanced_sampler(dataset: HybridDataset) -> WeightedRandomSampler:
-    """
-    Create a weighted random sampler for balanced 50/50 sampling between datasets.
+    """Create weighted sampler for N datasets."""
+    counts = {
+        HybridDataset.SILICON_LABEL: dataset.silicon_count,
+        HybridDataset.UEYES_LABEL: dataset.ueyes_count,
+        HybridDataset.MASSVIS_LABEL: dataset.massvis_count,
+        HybridDataset.FIWI_LABEL: dataset.fiwi_count
+    }
     
-    This is CRITICAL to prevent the larger Silicon dataset from drowning out 
-    the smaller Ueyes (UI) dataset during training.
-    
-    Args:
-        dataset: HybridDataset instance
-    
-    Returns:
-        WeightedRandomSampler configured for balanced sampling
-    """
-    # Calculate weights for each source
-    silicon_weight = 1.0 / max(dataset.silicon_count, 1)
-    ueyes_weight = 1.0 / max(dataset.ueyes_count, 1)
-    
-    print(f"[BalancedSampler] Silicon weight: {silicon_weight:.6f} ({dataset.silicon_count} samples)")
-    print(f"[BalancedSampler] Ueyes weight: {ueyes_weight:.6f} ({dataset.ueyes_count} samples)")
-    
-    # Assign weight to each sample based on its source
-    weights = []
-    for _, _, source_label in dataset.samples:
-        if source_label == HybridDataset.SILICON_LABEL:
-            weights.append(silicon_weight)
+    # Calculate weight for each class: 1.0 / count
+    weights_map = {}
+    valid_datasets = 0
+    for label, count in counts.items():
+        if count > 0:
+            weights_map[label] = 1.0 / count
+            valid_datasets += 1
         else:
-            weights.append(ueyes_weight)
+            weights_map[label] = 0.0
+            
+    if valid_datasets == 0:
+        return None
+
+    # Assign weights
+    sample_weights = []
+    for _, _, label in dataset.samples:
+        sample_weights.append(weights_map[label])
     
-    weights = torch.tensor(weights, dtype=torch.float64)
+    sample_weights = torch.tensor(sample_weights, dtype=torch.float64)
     
-    # Number of samples to draw per epoch
-    # Use 2x the smaller dataset size to ensure good coverage
-    num_samples = 2 * min(dataset.silicon_count, dataset.ueyes_count)
-    num_samples = max(num_samples, len(dataset))  # At least full dataset size
+    # Total samples = k * min_dataset_size * num_datasets (heuristic)
+    # Or simply: len(dataset) but balanced. 
+    # Let's ensure we see every image from the smallest resource at least once per epoch essentially.
+    active_counts = [c for c in counts.values() if c > 0]
+    num_samples = max(len(dataset), len(active_counts) * min(active_counts) * 2)
     
     sampler = WeightedRandomSampler(
-        weights=weights,
+        weights=sample_weights,
         num_samples=num_samples,
-        replacement=True  # Required for weighted sampling
+        replacement=True
     )
-    
-    print(f"[BalancedSampler] Will draw {num_samples} samples per epoch")
-    
     return sampler
 
-
-# Quick test
 if __name__ == "__main__":
-    # Test loading from default paths
-    silicon_path = "models/Datasets/Silicon"
-    ueyes_path = "models/Datasets/Ueyes"
-    
-    print("Testing HybridDataset...")
-    dataset = HybridDataset(silicon_path, ueyes_path, split='train')
-    
-    if len(dataset) > 0:
-        img, smap, label = dataset[0]
-        print(f"Sample 0: image shape={img.shape}, map shape={smap.shape}, label={label}")
-        
-        print("\nTesting balanced sampler...")
-        sampler = get_balanced_sampler(dataset)
-        print("Sampler created successfully!")
-    else:
-        print("WARNING: No samples loaded!")
+    # Test paths (relative to project root)
+    dataset = HybridDataset(
+        silicon_root="models/Datasets/Silicon",
+        ueyes_root="models/Datasets/Ueyes",
+        massvis_root="models/Datasets/massvis",
+        fiwi_root="models/Datasets/mobile ui salency",
+        salchart_root="models/Datasets/SALchart QA"
+    )
+    print(f"Total loaded: {len(dataset)}")

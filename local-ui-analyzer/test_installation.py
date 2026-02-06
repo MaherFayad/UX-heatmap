@@ -4,22 +4,30 @@ import os
 
 print(f"Python: {sys.version}")
 print(f"Torch: {torch.__version__}")
-
-# 1. Test DirectML
-print("\n--- Testing DirectML ---")
 try:
-    import torch_directml
-    dml = torch_directml.device()
-    print(f"DirectML Device found: {dml}")
-    
-    # Simple tensor op
-    x = torch.ones(5).to(dml)
-    print(f"Tensor on DML: {x}")
-    print("DirectML Basic Tensor Op: SUCCESS")
-except ImportError:
-    print("torch_directml not installed.")
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"Device Name: {torch.cuda.get_device_name(0)}")
+        print(f"Capability: {torch.cuda.get_device_capability(0)}")
+    else:
+        print("WARNING: CUDA is NOT available.")
 except Exception as e:
-    print(f"DirectML Error: {e}")
+    print(f"Error checking CUDA: {e}")
+
+# 1. Test Tensor Ops (CUDA)
+print("\n--- Testing CUDA Tensor Ops ---")
+try:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        x = torch.ones(5).to(device)
+        y = x * 2
+        print(f"Tensor on CUDA: {y}")
+        print("Basic Tensor Op: SUCCESS")
+    else:
+        print("Skipping CUDA tensor op test (CUDA not available)")
+except Exception as e:
+    print(f"CUDA Op Error: {e}")
 
 # 2. Test Model Architecture
 print("\n--- Testing EML-NET Model ---")
@@ -28,8 +36,12 @@ try:
     model = EMLNet()
     print("Model initialized successfully.")
     
-    # Forward pass (CPU)
-    dummy_input = torch.randn(2, 3, 480, 640)
+    # Forward pass
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Moving model to {device}...")
+    model.to(device)
+    
+    dummy_input = torch.randn(2, 3, 480, 640).to(device)
     print(f"Running forward pass with input {dummy_input.shape}...")
     output = model(dummy_input)
     print(f"Output shape: {output.shape}")

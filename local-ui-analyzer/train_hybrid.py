@@ -44,6 +44,9 @@ WEIGHT_DECAY = 1e-5
 # Paths (relative to project root)
 SILICON_ROOT = "models/Datasets/Silicon"
 UEYES_ROOT = "models/Datasets/Ueyes"
+MASSVIS_ROOT = "models/Datasets/massvis"
+FIWI_ROOT = "models/Datasets/mobile ui salency"
+SALCHART_ROOT = "models/Datasets/SALchart QA"
 MODEL_SAVE_PATH = "models/eml_net_hybrid.pth"
 
 # Device configuration
@@ -257,17 +260,31 @@ def main(args):
     # ==========================================================================
     # Load Datasets
     # ==========================================================================
-    print(f"\n[1/4] Loading datasets...")
+    print(f"\n[1/4] Loading Datasets...")
     
+    # filter roots based on --dataset flag
+    s_root = SILICON_ROOT if args.dataset in ['all', 'silicon'] else None
+    u_root = UEYES_ROOT if args.dataset in ['all', 'ueyes'] else None
+    m_root = MASSVIS_ROOT if args.dataset in ['all', 'massvis'] else None
+    f_root = FIWI_ROOT if args.dataset in ['all', 'mobile'] else None
+    sc_root = SALCHART_ROOT if args.dataset in ['all', 'salchart'] else None
+
     train_dataset = HybridDataset(
-        silicon_root=SILICON_ROOT,
-        ueyes_root=UEYES_ROOT,
+        silicon_root=s_root,
+        ueyes_root=u_root,
+        massvis_root=m_root,
+        fiwi_root=f_root,
+        salchart_root=sc_root,
         split='train'
     )
+    # Note: SALchart is currently stubbed in loader, but we can pass it if we add support
     
     val_dataset = HybridDataset(
-        silicon_root=SILICON_ROOT,
-        ueyes_root=UEYES_ROOT,
+        silicon_root=s_root,
+        ueyes_root=u_root,
+        massvis_root=m_root,
+        fiwi_root=f_root,
+        salchart_root=sc_root,
         split='val'
     )
     
@@ -411,6 +428,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=EPOCHS, help=f"Number of epochs (default: {EPOCHS})")
     parser.add_argument('--dry-run', action='store_true', help="Run only 1 epoch for testing")
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE, help=f"Batch size (default: {BATCH_SIZE})")
+    parser.add_argument('--dataset', type=str, default='all', choices=['all', 'silicon', 'ueyes', 'massvis', 'mobile', 'salchart'], help="Specific dataset to train on")
     
     args = parser.parse_args()
     
