@@ -23,6 +23,7 @@ function App() {
   const [error, setError] = useState('')
   const fileRef = useRef(null)
   const [fileName, setFileName] = useState('')
+  const [selectedFile, setSelectedFile] = useState(null)
   const [showExportMenu, setShowExportMenu] = useState(false)
   const [showImageMenu, setShowImageMenu] = useState(false)
   const exportRef = useRef(null)
@@ -50,9 +51,8 @@ function App() {
         if (!url.trim()) { setError('Please enter a URL'); setStep(1); setLoading(false); return }
         formData.append('url', url)
       } else {
-        const file = fileRef.current?.files?.[0]
-        if (!file) { setError('Please select an image'); setStep(1); setLoading(false); return }
-        formData.append('image', file)
+        if (!selectedFile) { setError('Please select an image'); setStep(1); setLoading(false); return }
+        formData.append('image', selectedFile)
       }
 
       let deviceType = 'desktop'
@@ -331,7 +331,7 @@ function App() {
                             type="file"
                             accept="image/*"
                             hidden
-                            onChange={e => setFileName(e.target.files?.[0]?.name || '')}
+                            onChange={e => { const f = e.target.files?.[0]; setFileName(f?.name || ''); setSelectedFile(f || null) }}
                           />
                           <ImagePlus size={32} className="upload-icon" />
                           <span className="upload-text">{fileName || 'Click or drag image to upload'}</span>

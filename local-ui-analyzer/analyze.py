@@ -1476,12 +1476,8 @@ def generate_deterministic_scanpath(saliency_map: np.ndarray,
             x_coords = np.linspace(0, 1, width, dtype=np.float32)
             y_grid, x_grid = np.meshgrid(y_coords, x_coords, indexing='ij')
             
-            # Within-fold Y bias: favor top of current viewport
-            # Normalize y position within fold to [0, 1]
+            # Uniform within fold — no vertical position bias
             fold_y_bias = np.ones((height, width), dtype=np.float32)
-            for y in range(fold_start_y, fold_end_y):
-                relative_y = (y - fold_start_y) / max(1, fold_height - 1)
-                fold_y_bias[y, :] = 1.0 - (relative_y * 0.4)  # Top of fold gets 1.0, bottom gets 0.6
             
             # X bias: left-to-right reading (F-pattern)
             x_bias = np.power(1.0 - x_grid, 0.3)
@@ -1728,10 +1724,8 @@ def generate_scroll_depth_analysis(image: np.ndarray, boxes: list[dict],
         zone_attention = attention_mask[start_y:end_y, :].sum()
         zone_pct = (zone_attention / total_attention * 100) if total_attention > 0 else 0
         
-        # Estimate "Visibility Opportunity" (decay)
-        # Assuming 100% at top, decaying by 20% per scroll roughly
-        # Formula: 100 * (0.8 ^ i)
-        visibility = 100.0 * (0.8 ** i)
+        # No visibility decay — treat all folds equally
+        visibility = 100.0
         
         # Count boxes in this zone
         zone_boxes = sum(1 for b in boxes 
@@ -1916,14 +1910,11 @@ def run_analysis(image_path: str, output_dir: str = "output",
     
     attention_mask = None
     if saliency_map_uint8 is not None:
-        # Normalize and inject Hero-Centric Bias
+        # Use pure EML-NET saliency — no spatial bias applied
         attention_mask = saliency_map_uint8.astype(np.float32) / 255.0
-        hero_bias = generate_center_bias_map(image.shape[:2], viewport_height=viewport_height)
-        # Blend: EML-NET (85%) + Hero Spatial Prior (15%)
-        attention_mask = (attention_mask * 0.85) + (hero_bias * 0.15)
         if attention_mask.max() > 0:
             attention_mask /= attention_mask.max()
-        print("  EML-NET Saliency Map generated successfully.")
+        print("  EML-NET Saliency Map generated successfully (uniform — no hero bias).")
     else:
         print("  Warning: EML-NET failed. Will fallback to box-based Hero-centric heatmap.")
     
